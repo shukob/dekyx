@@ -1,127 +1,173 @@
 # DeKYX — Decentralized Know Your X
 
-DeKYX is the reusable identity and participation-qualification layer. It is not
-an Aethel subcomponent. `X` may be a person, legal entity, device, service, or
-autonomous agent.
+DeKYX is a reusable identity and participation-qualification layer for systems
+that must verify eligibility without exposing more identity information than
+the application needs.
 
-## Boundary
+`X` may be a person, legal entity, device, service, or autonomous agent. An
+issuer creates a credential, the holder proves only the qualifications required
+for one action, and the application receives a scoped eligibility result rather
+than the holder's full identity record.
 
-- DeKYX owns issuer trust and key epochs, KYC/KYB subject type, qualification
-  attributes, selective disclosure, anonymous zero-knowledge presentation,
-  revocation, key rotation, exact scope/request binding, and presentation
-  replay consumption.
-- DeCCP consumes a verified qualification when admitting a clearing member.
-- Aethel consumes a verified qualification before recording a private credit
-  decision or guarantee reference.
-- zkPI carries an executable instruction; DeFMI updates the authoritative
-  ledger. Neither belongs here.
+This repository contains standalone Rust crates. It is a research
+implementation and has not been audited or certified as a KYC/KYB system.
 
-`dekyx-core` has no application dependency. `dekyx-aethel` is an explicit
-adapter that shapes Aethel's request and returns the subject-binding record
-Aethel stores beside a credit decision or guarantee. It does not depend on
-`aethel-core`; `aethel-core` depends on it.
+## What DeKYX provides
 
-This directory is a standalone, locked Rust workspace rather than a crate added
-to QOMM. The enclosing TradFi repository ignores new `mvp/*` projects, matching
-the intended later publication as its own repository. No nested Git history or
-remote is created here.
+- Governance-controlled issuer registration and issuer-key epochs.
+- Credentials for multiple subject kinds and application scopes.
+- Holder-generated secrets and proof-of-possession at issuance.
+- Selective disclosure of required qualification attributes.
+- Anonymous presentations bound to one audience, action, request, nonce, and
+  validity window.
+- Scope-specific nullifiers for controlled linkability within one policy.
+- Re-randomized commitments across presentations and scopes.
+- Signed, monotonic revocation status lists.
+- Issuer-key rotation with grace periods and an immediate compromise path.
+- Replay prevention using the presentation nullifier and exact context.
+- Validated persistence formats for issuer directories and replay ledgers.
+- A small optional adapter for Aethel credit and guarantee artifacts.
 
-## Objects and their owners
+## Credential and presentation flow
 
-| Object | Produced by | Verified by |
-|---|---|---|
-| `IssuerDefinition` (issuer id, key epoch, key, namespace, subject kinds, window) | the deployment's governance | `IssuerDirectory` on registration and on every reload |
-| `Credential` (signed scope commitment, policy, qualification root) | `CredentialIssuer`, after a holder issuance proof | `DeKyxVerifier` |
-| `RevocationStatusList` (signed, epoch-ordered) | the issuer key of the epoch it covers | `IssuerDirectory::publish_status_list`, then every presentation |
-| `AnonymousPresentation` | the holder, for one exact `PresentationContext` | `DeKyxVerifier::verify_eligibility` |
-| `VerifiedEligibility` / `AethelSubjectBinding` | DeKYX only | stored by the application |
+```mermaid
+sequenceDiagram
+    participant G as Governance
+    participant I as Credential issuer
+    participant H as Holder
+    participant D as DeKYX verifier
+    participant A as Application
 
-## Privacy, lines, and unlinkability
+    G->>D: Register issuer, key epoch, namespace and policy
+    H->>H: Generate subject secret and commitment
+    H->>I: Credential request + proof of possession
+    I->>H: Signed scoped credential
+    I->>D: Signed revocation status list
+    A->>H: Exact presentation context and requirements
+    H->>D: Anonymous presentation + selected qualification proofs
+    D->>D: Verify issuer, signature, status, scope, context and replay
+    D-->>A: VerifiedEligibility / scoped subject line
+```
 
-The issuer signs a scope-specific Pedersen commitment, a policy digest, and a
-Merkle root of qualifications. The holder discloses only the required
-qualification leaves and proves in zero knowledge that the signed commitment
-and scope nullifier contain the same secret. The proof challenge includes the
-audience, action, request, nonce, and expiration context, so a transcript made
-for one artifact cannot be moved to another.
+The application never receives the holder's secret. It receives only the
+verified output needed to authorize the requested action.
 
-The holder, not the issuer, generates the subject secret. Issuance requires a
-zero-knowledge proof that the holder knows the opening of the requested
-commitment, so the normal API never passes the secret or blinding scalar to the
-issuer. Every eligibility requirement names the exact issuer id, key epoch, and
-issuer namespace digest; merely being present in a broad registry is not enough
-to satisfy an unrelated policy.
+## Core objects
 
-A **subject line** is `H(issuer, scope, policy, scope nullifier)`. It excludes
-the issuer key epoch and the commitment blinding, so a credential re-issued
-under a rotated issuer key, or with a fresh blinding, continues the same line
-as long as the same subject secret is presented in the same scope. Two scopes
-use unrelated nullifier bases and re-randomized commitments
-(`CredentialWitness::rerandomize`), so nothing a verifier sees links them.
+| Object | Purpose |
+|---|---|
+| `IssuerDefinition` | Defines an issuer, key epoch, namespace, subject kinds, and validity window |
+| `IssuerDirectory` | Holds validated issuer epochs and current revocation lists |
+| `CredentialRequest` | Binds a holder-created commitment to an issuance proof |
+| `Credential` | Contains the issuer-signed scope, policy, commitment, and qualification root |
+| `RevocationStatusList` | Publishes an issuer-signed, epoch-ordered set of revoked credential digests |
+| `PresentationContext` | Binds a proof to one audience, action, request, nonce, and expiry |
+| `AnonymousPresentation` | Proves credential possession and selected qualifications for that context |
+| `VerifiedEligibility` | Non-serializable result produced only after verification |
+| `PresentationLedger` | Consumes a nullifier-context pair and rejects replay |
 
-This first contract is scope-pseudonymous, not a claim of issuer-unlinkable
-anonymous credentials: the Ed25519-signed commitment is stable inside one
-credential and can be correlated with the issuance record. A later BBS+/CL or
-equivalent rerandomizable-signature adapter can strengthen that property
-without changing the provider boundary.
+## Privacy model
 
-## Revocation, key rotation, and replay
+The holder generates the subject secret and proves knowledge of the commitment
+opening during issuance. The issuer does not receive that secret through the
+normal API.
 
-Revocation lists are issuer-signed, epoch-ordered, canonical sets of credential
-digests. A stale list fails closed, an older list cannot replace a newer one,
-and an epoch without a published list cannot verify anything
-(`DeKyxError::MissingStatusList`).
+Qualification leaves are committed in a Merkle root. A presentation reveals
+only the leaves required by the application's policy and proves that they
+belong to the signed root. Its challenge includes the audience, action,
+request, nonce, and expiration, so a transcript for one operation cannot be
+moved to another.
 
-`IssuerDirectory` holds every accepted key epoch of every issuer and the latest
-status list per epoch. `rotate_key` registers a strictly higher epoch with a
-different key and bounds the earlier epochs to a grace instant; a grace instant
-before their `valid_from` revokes them immediately, which is the key-compromise
-path. The directory serializes as plain data and deserializes only through the
-same validation that live registration performs.
+A **subject line** is derived from the issuer, scope, policy, and scope
+nullifier. It stays stable when the same holder receives a replacement
+credential under a rotated issuer key, allowing an application to enforce one
+line or one limit without learning a legal identity. Different scopes use
+different nullifier bases and re-randomized commitments.
 
-`PresentationLedger` consumes the (scope nullifier, context) pair so that a
-re-randomized proof of the same credential for the same context is a replay.
-The ledger is monotone; an application that persists it must authenticate the
-persisted copy, because a truncated ledger re-enables replay.
+This version is **scope-pseudonymous**, not fully issuer-unlinkable. An
+Ed25519-signed commitment is stable inside one credential and may be correlated
+with the issuer's issuance record. Deployments requiring stronger issuance
+unlinkability need a rerandomizable credential scheme such as a reviewed BBS+
+or CL-signature adapter.
+
+## Revocation, rotation, and replay
+
+Every accepted issuer-key epoch must have a signed status list. A missing or
+stale list fails closed, and an older list cannot replace a newer one.
+
+Key rotation registers a strictly higher epoch and bounds earlier epochs by a
+grace instant. A grace instant before the old key's start time provides an
+immediate compromise response. Previously verified application records remain
+application state; the retired key cannot authorize a new presentation after
+its allowed window.
+
+`PresentationLedger` consumes the pair of scope nullifier and presentation
+context. Re-randomizing the proof does not make the same action reusable. The
+host must persist this ledger in authenticated storage because rolling it back
+would re-enable a replay.
 
 ## Persistence boundary
 
-- `IssuerRegistry` and `IssuerDirectory` cannot be deserialized around their
-  validation (`IssuerRegistry` has no `Deserialize`; `IssuerDirectory` uses a
-  validated `TryFrom` record).
-- Credentials, status lists, presentations, and contexts are wire types.
-- `VerifiedEligibility` is deliberately not serializable: it is the output of a
-  verification, not an input.
+- `IssuerRegistry` cannot be deserialized around its validation.
+- `IssuerDirectory` restores only through a validated record conversion.
+- Credentials, status lists, presentations, and contexts are wire data and are
+  verified before use.
+- `VerifiedEligibility` is deliberately not serializable; it is an output of
+  verification, never a trusted input.
 
-## Aethel integration
+## Dependencies and integration
 
-`aethel-core` (in `mvp/qomm/rust`) depends on `dekyx-core` and `dekyx-aethel`
-by sibling path. Aethel keeps the DeKYX `IssuerDirectory` inside its book,
-records which credential-issuer provider vouches for each DeKYX issuer key,
-publishes issuer-signed status lists, and hands every holder presentation to
-`AethelDeKyxAdapter::verify` for the exact credit decision or guarantee it is
-bound to. Aethel stores only the returned `AethelSubjectBinding`. The former
-Aethel-owned credential, proof, and issuer-capability verification code is
-gone, and the legacy `qomm-zkpi::confidential_subject` module has been
-deleted: DeKYX is the only implementation of KYB and anonymous presentation.
+DeKYX is application-independent. Integrations consume its verified result
+instead of reimplementing credentials.
 
-The Avalanche VM in `mvp/qomm` uses DeKYX a second time, through DeCCP's
-`EligibilityPort`: an Aethel guarantor joins the DeCCP clearing book by
-presenting a credential for the clearing-membership scope, and DeCCP records
-only the resulting subject line.
+```mermaid
+flowchart TB
+    CORE["dekyx-core\ncredential and presentation verification"]
+    AA["dekyx-aethel\noptional artifact binding"]
+    A["Aethel\ncredit and guarantee eligibility"]
+    C["DeCCP\nclearing-member admission"]
+    O["Other applications\npolicy-specific eligibility"]
 
-## Publication
+    CORE --> AA --> A
+    CORE --> C
+    CORE --> O
+    Z["zkPI / DeFMI"] -. "no direct credential dependency" .-> CORE
+```
 
-`mvp/qomm/rust/qomm-harness/src/bin/export_repos.rs` publishes this
-workspace as the `dekyx` repository (manifest, lock, `crates/`, this README,
-and the shared MIT `LICENSE`; the workspace manifest declares MIT to match).
-`aethel` and `defmi` take it as a Git dependency, so it is exported and pushed
-before them.
+| Module | Relationship |
+|---|---|
+| `dekyx-core` | Standalone credential, presentation, issuer, revocation, and replay implementation; no application dependency |
+| `dekyx-aethel` | Optional adapter that binds a verified presentation to an Aethel artifact |
+| Aethel | Imports `dekyx-core` and `dekyx-aethel` for credit decisions and guarantees |
+| DeCCP | Consumes a verified result through its `EligibilityPort` when admitting a clearing member |
+| zkPI / DeFMI | Do not define credentials; a host may require DeKYX eligibility before creating or settling an instruction |
 
-## Verification
+## Repository layout
 
-All tests, Clippy, formatting, and builds run on an approved remote Linux
-worker; the local Mac is for reading, editing, and `cargo fmt`. The latest run
-(OmenX, Rust 1.97.1 and the 1.85.1 MSRV with `--locked`): 6 core and 2 adapter
-integration tests passed, warning-denied Clippy passed, formatting passed,
-optimized release build passed.
+```text
+crates/
+├── dekyx-core/     Issuers, credentials, qualification proofs, revocation, replay
+└── dekyx-aethel/   Optional binding for Aethel artifacts
+```
+
+## Enterprise PoC
+
+[Enterprise PoC guide (Japanese)](docs/ENTERPRISE_POC_JA.md) covers role
+separation, qualification policy, revocation, key rotation, replay rejection,
+evidence retention and acceptance criteria.
+
+## Build and verification
+
+Run the checks on Linux with the locked dependency graph:
+
+```sh
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo build --workspace --release --locked
+```
+
+The published revision passed these four gates. A real deployment must also
+define issuer governance, evidence standards, corporate-group resolution,
+revocation operations, data-retention policy, and jurisdiction-specific
+KYC/KYB obligations.
