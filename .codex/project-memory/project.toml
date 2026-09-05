@@ -1,0 +1,12 @@
+schema_version = 1
+project = "DeKYX"
+repository = "https://github.com/shukob/dekyx"
+implementation_language = "Rust"
+application = "Standalone selective qualification and credential verification"
+
+[boundaries]
+application_ownership = "Core only; application adapters live in each consuming application repository."
+
+[verification]
+allowed_remote_hosts = ["softbank-l40s", "omenx_ubuntu_zerotier"]
+local_builds_forbidden = true
